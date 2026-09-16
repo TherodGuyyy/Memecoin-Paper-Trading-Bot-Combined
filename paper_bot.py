@@ -473,7 +473,35 @@ async def main():
     if open_rows:
         print(f"Resumed monitoring {len(open_rows)} position(s) from before restart.")
 
-    @client.on(events.NewMessage(chats=TELEGRAM_CHANNEL))
+    # Connect first, then resolve the channel. TELEGRAM_CHANNEL is usually a
+    # display TITLE (e.g. "Mister M Alert Channel"), not a @username - and
+    # Telethon can only look usernames up directly. A title has to be found
+    # by scanning your actual list of chats, so we do that explicitly here
+    # instead of hoping a bare string resolves.
+    await client.start()
+    channel_entity = None
+    async for dialog in client.iter_dialogs():
+        if dialog.name == TELEGRAM_CHANNEL:
+            channel_entity = dialog.entity
+            break
+    if channel_entity is None:
+        async for dialog in client.iter_dialogs():
+            if dialog.name.strip().lower() == TELEGRAM_CHANNEL.strip().lower():
+                print(f"Note: matched '{dialog.name}' by case-insensitive title "
+                      f"(TELEGRAM_CHANNEL was set to '{TELEGRAM_CHANNEL}').")
+                channel_entity = dialog.entity
+                break
+    if channel_entity is None:
+        raise SystemExit(
+            f"Could not find a chat titled '{TELEGRAM_CHANNEL}' among your Telegram "
+            f"chats. This means either: the name doesn't match exactly (check for "
+            f"typos, extra spaces, or a trailing emoji in the real channel name), or "
+            f"the account this session belongs to isn't a member of that channel. "
+            f"No alerts can be received until this resolves."
+        )
+    print(f"Connected to channel: {channel_entity.title}")
+
+    @client.on(events.NewMessage(chats=channel_entity))
     async def handler(event):
         alert = parse_launch_alert(event.raw_text or "")
         if not alert:
@@ -500,7 +528,6 @@ async def main():
                 asyncio.create_task(engine.monitor_position(*row))
 
     print("Listening for launch alerts...")
-    await client.start()
     await client.run_until_disconnected()
 
 
