@@ -1,0 +1,26 @@
+databases:
+  - name: paperbot-db
+    plan: free
+    databaseName: paperbot
+    user: paperbot
+
+services:
+  - type: web
+    name: paperbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python paper_bot.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: paperbot-db
+          property: connectionString
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: TELEGRAM_CHANNEL
+        sync: false

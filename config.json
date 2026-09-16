@@ -1,0 +1,27 @@
+{
+  "starting_balance": 1000,
+  "position_size_pct": 5,
+  "max_exposure_pct": 30,
+  "fee_pct": 3,
+  "timeout_minutes": 90,
+  "price_poll_seconds": 15,
+
+  "fixed_target_multiple": 2.0,
+  "fixed_stop_loss_pct": 25,
+
+  "scaled_stop_loss_pct": 25,
+  "scaled_trailing_pct": 15,
+
+  "_comments": {
+    "note": "Telegram credentials and the database connection are NOT in this file - they live in environment variables (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_CHANNEL, DATABASE_URL). This file has no secrets, so it's safe to commit to GitHub.",
+    "starting_balance": "Your paper account's starting balance in dollars.",
+    "position_size_pct": "% of CURRENT balance risked on each new trade.",
+    "max_exposure_pct": "Once this % of balance is tied up in open positions, new alerts are skipped.",
+    "fee_pct": "Simulated round-trip fee + slippage, applied to every trade.",
+    "timeout_minutes": "Force-close a position after this many minutes if neither target nor stop hit.",
+    "fixed_target_multiple": "Take-profit target for the 'Fixed target' portfolio.",
+    "fixed_stop_loss_pct": "Stop-loss for the 'Fixed target' portfolio.",
+    "scaled_stop_loss_pct": "Stop-loss for the 'Scaled + trailing' portfolio if 2x is never reached.",
+    "scaled_trailing_pct": "Once 2x is hit, remaining position exits if price falls this % off peak."
+  }
+}
