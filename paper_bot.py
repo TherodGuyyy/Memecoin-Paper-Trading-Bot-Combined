@@ -170,7 +170,7 @@ def deployed_amount(portfolio):
 
 # ------------------------------ alert parsing --------------------------------
 
-CONTRACT_RE = re.compile(r"ð\s*([A-Za-z0-9]{30,50})")
+CONTRACT_RE = re.compile(r"📋\s*([A-Za-z0-9]{30,50})")
 MCAP_RE = re.compile(r"Market Cap:\s*\$?([\d,]+)")
 LAUNCH_HEADERS = ("GMGN NEW LAUNCH", "NEW LAUNCH ALERT")
 
@@ -415,7 +415,7 @@ def render_dashboard():
     {panel("Fixed target", portfolios["fixed"], "#7fae7f")}
     {panel("Scaled + trailing", portfolios["scaled"], "#d6a24c")}
   </div>
-  <div class="updated">Auto-refreshes every 20s Â· last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+  <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
 </body></html>"""
 
 
@@ -478,7 +478,21 @@ async def main():
     # Telethon can only look usernames up directly. A title has to be found
     # by scanning your actual list of chats, so we do that explicitly here
     # instead of hoping a bare string resolves.
-    await client.start()
+    # Never allow an interactive login attempt on a headless server - if the
+    # session isn't already valid, client.start() would otherwise sit here
+    # silently forever waiting for a phone/code prompt nobody can answer.
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise SystemExit(
+            "Telegram session is missing or invalid. This means the "
+            "TELEGRAM_SESSION environment variable on Render is empty, "
+            "wrong, or got mangled when it was pasted in (stray quotes or "
+            "line breaks are a common cause). Fix: run generate_session.py "
+            "locally again, copy the ENTIRE printed string with no extra "
+            "characters, and paste it into Render's TELEGRAM_SESSION "
+            "environment variable, then redeploy."
+        )
+
     channel_entity = None
     async for dialog in client.iter_dialogs():
         if dialog.name == TELEGRAM_CHANNEL:
