@@ -473,15 +473,25 @@ async def main():
     if open_rows:
         print(f"Resumed monitoring {len(open_rows)} position(s) from before restart.")
 
-    # Connect first, then resolve the channel. TELEGRAM_CHANNEL is usually a
-    # display TITLE (e.g. "Mister M Alert Channel"), not a @username - and
-    # Telethon can only look usernames up directly. A title has to be found
-    # by scanning your actual list of chats, so we do that explicitly here
-    # instead of hoping a bare string resolves.
     # Never allow an interactive login attempt on a headless server - if the
     # session isn't already valid, client.start() would otherwise sit here
     # silently forever waiting for a phone/code prompt nobody can answer.
-    await client.connect()
+    # A hard timeout is also needed: connect() has none by default, so any
+    # network trouble reaching Telegram would otherwise hang forever with
+    # zero output, indistinguishable from "still working."
+    print("Connecting to Telegram...", flush=True)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+    except asyncio.TimeoutError:
+        raise SystemExit(
+            "Timed out after 30s trying to reach Telegram's servers. This "
+            "points to a network-level problem from Render's side (outbound "
+            "connection to Telegram being slow/blocked), not a code or "
+            "credentials issue. Try redeploying once; if it keeps timing "
+            "out, that's worth flagging to Render support."
+        )
+    print("Connected. Checking session authorization...", flush=True)
+
     if not await client.is_user_authorized():
         raise SystemExit(
             "Telegram session is missing or invalid. This means the "
@@ -492,6 +502,7 @@ async def main():
             "characters, and paste it into Render's TELEGRAM_SESSION "
             "environment variable, then redeploy."
         )
+    print("Session is valid. Looking up your channel...", flush=True)
 
     channel_entity = None
     async for dialog in client.iter_dialogs():
