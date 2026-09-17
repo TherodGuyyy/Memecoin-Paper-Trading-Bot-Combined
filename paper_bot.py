@@ -184,21 +184,56 @@ def deployed_amount(portfolio):
 # ------------------------------ alert parsing --------------------------------
 
 CONTRACT_RE = re.compile(r"📋\s*([A-Za-z0-9]{30,50})")
-MCAP_RE = re.compile(r"Market Cap:\s*\$?([\d,]+)")
+# Market cap can show up as "$45,231", "45.2K", "1.2M", "2.1B", or occasionally
+# "N/A" / "Pending" when a token is too fresh for the alert bot to have real
+# data yet. The old version of this regex only matched the first form, so
+# every other form silently failed to parse - the alert vanished with no log
+# line, no DB row, nothing. That's disproportionately likely to hit very new,
+# very thin-liquidity launches, which are also disproportionately where big
+# runners come from. This version handles all the numeric forms; "N/A"/
+# "Pending" still can't be traded (there's no entry mcap to compare against)
+# but now gets logged instead of vanishing.
+MCAP_RE = re.compile(r"Market Cap:\s*\$?([\d,]+\.?\d*)\s*([KkMmBb]?)")
+MCAP_UNKNOWN_RE = re.compile(r"Market Cap:\s*\$?\s*(N/?A|[Pp]ending|--?)")
 LAUNCH_HEADERS = ("GMGN NEW LAUNCH", "NEW LAUNCH ALERT")
+_MCAP_MULT = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+
+
+def log_skip(portfolio, contract, name, reason):
+    """Record a reason an alert never became a trade, so 'why didn't this
+    get traded' has an answer somewhere other than silence. portfolio is
+    'parse' for failures that happen before either portfolio is even
+    considered (bad contract/mcap format)."""
+    with db() as con:
+        con.cursor().execute(
+            ph("INSERT INTO skipped (portfolio, ts, contract, name, reason) VALUES (?,?,?,?,?)"),
+            (portfolio, now_iso(), contract or "", name or "", reason))
+    print(f"[skip] {reason}: {name or contract or '(unknown)'}")
 
 
 def parse_launch_alert(text):
     if not any(h in text for h in LAUNCH_HEADERS):
         return None
-    cmatch = CONTRACT_RE.search(text)
-    mmatch = MCAP_RE.search(text)
-    if not cmatch or not mmatch:
-        return None
-    contract = cmatch.group(1)
-    mcap = float(mmatch.group(1).replace(",", ""))
+
     lines = text.split("\n")
-    name = lines[2].strip() if len(lines) > 2 and lines[2].strip() else contract[:8]
+    cmatch = CONTRACT_RE.search(text)
+    contract = cmatch.group(1) if cmatch else None
+    name = lines[2].strip() if len(lines) > 2 and lines[2].strip() else (contract[:8] if contract else "unknown")
+
+    if not cmatch:
+        log_skip("parse", None, name, "unparsed: no contract address matched")
+        return None
+
+    mmatch = MCAP_RE.search(text)
+    if not mmatch or not mmatch.group(1):
+        if MCAP_UNKNOWN_RE.search(text):
+            log_skip("parse", contract, name, "unparsed: market cap not yet available (N/A/Pending)")
+        else:
+            log_skip("parse", contract, name, "unparsed: market cap format not recognized")
+        return None
+
+    number_part, suffix = mmatch.group(1), mmatch.group(2).upper()
+    mcap = float(number_part.replace(",", "")) * _MCAP_MULT.get(suffix, 1)
     return {"contract": contract, "mcap": mcap, "name": name}
 
 
@@ -231,11 +266,8 @@ class PaperEngine:
         deployed = deployed_amount(portfolio)
         cap = balance * (cfg["max_exposure_pct"] / 100)
         if deployed + bet_size > cap:
-            with db() as con:
-                con.cursor().execute(
-                    ph("INSERT INTO skipped (portfolio, ts, contract, name, reason) VALUES (?,?,?,?,?)"),
-                    (portfolio, now_iso(), contract, name, "exposure cap reached"))
-            print(f"[{portfolio}] skipped {name} - exposure cap reached")
+            log_skip(portfolio, contract, name,
+                      f"exposure cap reached (${deployed:,.2f} deployed of ${cap:,.2f} cap)")
             return None
         with db() as con:
             cur = con.cursor()
@@ -361,6 +393,14 @@ def render_dashboard():
             portfolios[name] = {"balance": bal, "curve": curve, "total": total,
                                  "wins": wins, "open_count": open_count, "recent": recent}
 
+        cur.execute("""SELECT ts, contract, name, reason FROM skipped
+                       ORDER BY ts DESC LIMIT 20""")
+        recent_skips = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM skipped WHERE reason LIKE 'exposure cap%'")
+        skip_cap_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM skipped WHERE reason LIKE 'unparsed%'")
+        skip_parse_count = cur.fetchone()[0]
+
     def curve_svg(curve, color):
         if len(curve) < 2:
             return "<div style='color:#948c7c;font-size:12px;'>Not enough data yet.</div>"
@@ -402,6 +442,31 @@ def render_dashboard():
           {rows_html(p['recent'])}
         </div>"""
 
+    def skips_html():
+        if not recent_skips:
+            return '<div class="muted">No skipped alerts recorded.</div>'
+        out = ['<table><tr><th>Time</th><th>Token</th><th>Reason</th></tr>']
+        for ts, contract, name, reason in recent_skips:
+            label = name or (contract[:8] + "..." if contract else "(unknown)")
+            try:
+                t = datetime.fromisoformat(ts).strftime("%m-%d %H:%M")
+            except Exception:
+                t = ts
+            out.append(f'<tr><td>{t}</td><td>{label}</td><td>{reason}</td></tr>')
+        out.append("</table>")
+        return "".join(out)
+
+    skips_panel = f"""
+        <div class="panel" style="max-width:1200px;margin:24px auto 0;">
+          <h2>Skipped alerts</h2>
+          <div class="stats">
+            <div><span class="muted">Exposure cap skips</span><br>{skip_cap_count}</div>
+            <div><span class="muted">Unparsed alert skips</span><br>{skip_parse_count}</div>
+          </div>
+          <h3>Most recent 20</h3>
+          {skips_html()}
+        </div>"""
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <meta http-equiv="refresh" content="20">
@@ -428,6 +493,7 @@ def render_dashboard():
     {panel("Fixed target", portfolios["fixed"], "#7fae7f")}
     {panel("Scaled + trailing", portfolios["scaled"], "#d6a24c")}
   </div>
+  {skips_panel}
   <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
   &nbsp;·&nbsp;<a href="/admin" style="color:#948c7c;">set balance</a></div>
 </body></html>"""

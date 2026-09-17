@@ -6,8 +6,8 @@
   "timeout_minutes": 90,
   "price_poll_seconds": 15,
 
-  "fixed_target_multiple": 2.0,
-  "fixed_stop_loss_pct": 25,
+  "fixed_target_multiple": 2.5,
+  "fixed_stop_loss_pct": 35,
 
   "scaled_stop_loss_pct": 25,
   "scaled_trailing_pct": 15,
