@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from flask import Flask
+from flask import Flask, request, redirect
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -49,6 +49,7 @@ TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
 USE_PG = bool(DATABASE_URL)
 
@@ -158,6 +159,18 @@ def set_balance(portfolio, new_balance):
         cur.execute(ph("UPDATE portfolios SET balance=? WHERE name=?"), (new_balance, portfolio))
         cur.execute(ph("INSERT INTO balance_history (portfolio, ts, balance) VALUES (?, ?, ?)"),
                     (portfolio, now_iso(), new_balance))
+
+
+def manual_set_balance(portfolio, new_balance):
+    """Used by the /admin panel: force a portfolio's balance to a chosen
+    value, and clear any open positions (they were sized against whatever
+    the balance was before this change, so they no longer make sense)."""
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(ph("UPDATE portfolios SET balance=? WHERE name=?"), (new_balance, portfolio))
+        cur.execute(ph("INSERT INTO balance_history (portfolio, ts, balance) VALUES (?, ?, ?)"),
+                    (portfolio, now_iso(), new_balance))
+        cur.execute(ph("DELETE FROM open_positions WHERE portfolio=?"), (portfolio,))
 
 
 def deployed_amount(portfolio):
@@ -415,7 +428,8 @@ def render_dashboard():
     {panel("Fixed target", portfolios["fixed"], "#7fae7f")}
     {panel("Scaled + trailing", portfolios["scaled"], "#d6a24c")}
   </div>
-  <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+  <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+  &nbsp;·&nbsp;<a href="/admin" style="color:#948c7c;">set balance</a></div>
 </body></html>"""
 
 
@@ -437,6 +451,71 @@ def dashboard():
         return render_dashboard()
     except Exception as e:
         return f"Dashboard error (bot may still be starting up): {e}", 500
+
+
+ADMIN_FORM = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Admin</title>
+<style>
+  body {{ background:#14120f; color:#ece6d9; font-family:-apple-system,sans-serif;
+         padding:40px; max-width:420px; margin:0 auto; }}
+  h1 {{ font-size:18px; }}
+  label {{ display:block; margin:16px 0 6px; color:#948c7c; font-size:13px; }}
+  input {{ width:100%; padding:9px 10px; background:#1d1a15; border:1px solid #34302a;
+          color:#ece6d9; border-radius:4px; font-family:monospace; box-sizing:border-box; }}
+  button {{ margin-top:20px; width:100%; padding:11px; background:#d6a24c; color:#1a1712;
+           border:none; border-radius:4px; font-weight:600; cursor:pointer; }}
+  .msg {{ background:#1d1a15; border-left:3px solid #d6a24c; padding:10px 14px;
+         border-radius:4px; font-size:13px; margin-bottom:16px; }}
+  a {{ color:#d6a24c; }}
+</style></head>
+<body>
+  <h1>Set balance</h1>
+  {message}
+  <form method="POST" action="/admin/set-balance">
+    <label>Admin key</label>
+    <input type="password" name="key" required>
+    <label>Fixed-target portfolio balance ($) - leave blank to leave unchanged</label>
+    <input type="number" step="0.01" name="fixed_balance" placeholder="e.g. 20">
+    <label>Scaled+trailing portfolio balance ($) - leave blank to leave unchanged</label>
+    <input type="number" step="0.01" name="scaled_balance" placeholder="e.g. 20">
+    <button type="submit">Set balance</button>
+  </form>
+  <p style="margin-top:20px;font-size:12px;color:#948c7c;">
+    Setting a balance clears that portfolio's open positions (they were sized
+    against the old balance) but keeps its trade history.
+    <br><br><a href="/dashboard">&larr; back to dashboard</a>
+  </p>
+</body></html>"""
+
+
+@flask_app.route("/admin")
+def admin_form():
+    if not ADMIN_KEY:
+        return ("Admin panel is disabled: set an ADMIN_KEY environment variable "
+                "on Render to enable it.", 403)
+    return ADMIN_FORM.format(message="")
+
+
+@flask_app.route("/admin/set-balance", methods=["POST"])
+def admin_set_balance():
+    if not ADMIN_KEY:
+        return ("Admin panel is disabled: set an ADMIN_KEY environment variable "
+                "on Render to enable it.", 403)
+    if request.form.get("key") != ADMIN_KEY:
+        return (ADMIN_FORM.format(
+            message='<div class="msg">Wrong admin key - nothing was changed.</div>'), 403)
+
+    changed = []
+    for portfolio, field in [("fixed", "fixed_balance"), ("scaled", "scaled_balance")]:
+        raw = request.form.get(field, "").strip()
+        if raw:
+            try:
+                amount = float(raw)
+                manual_set_balance(portfolio, amount)
+                changed.append(f"{portfolio} set to ${amount:,.2f}")
+            except ValueError:
+                pass
+    return redirect("/dashboard")
 
 
 def run_flask():

@@ -24,3 +24,5 @@ services:
         sync: false
       - key: TELEGRAM_CHANNEL
         sync: false
+      - key: ADMIN_KEY
+        sync: false
