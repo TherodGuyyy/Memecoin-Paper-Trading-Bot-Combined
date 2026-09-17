@@ -170,7 +170,7 @@ def deployed_amount(portfolio):
 
 # ------------------------------ alert parsing --------------------------------
 
-CONTRACT_RE = re.compile(r"📋\s*([A-Za-z0-9]{30,50})")
+CONTRACT_RE = re.compile(r"ð\s*([A-Za-z0-9]{30,50})")
 MCAP_RE = re.compile(r"Market Cap:\s*\$?([\d,]+)")
 LAUNCH_HEADERS = ("GMGN NEW LAUNCH", "NEW LAUNCH ALERT")
 
@@ -415,7 +415,7 @@ def render_dashboard():
     {panel("Fixed target", portfolios["fixed"], "#7fae7f")}
     {panel("Scaled + trailing", portfolios["scaled"], "#d6a24c")}
   </div>
-  <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+  <div class="updated">Auto-refreshes every 20s Â· last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
 </body></html>"""
 
 
