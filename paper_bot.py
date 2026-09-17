@@ -504,27 +504,46 @@ async def main():
         )
     print("Session is valid. Looking up your channel...", flush=True)
 
-    channel_entity = None
-    async for dialog in client.iter_dialogs():
-        if dialog.name == TELEGRAM_CHANNEL:
-            channel_entity = dialog.entity
-            break
-    if channel_entity is None:
+    async def find_channel():
+        exact_match = None
+        loose_match = None
+        count = 0
         async for dialog in client.iter_dialogs():
-            if dialog.name.strip().lower() == TELEGRAM_CHANNEL.strip().lower():
-                print(f"Note: matched '{dialog.name}' by case-insensitive title "
-                      f"(TELEGRAM_CHANNEL was set to '{TELEGRAM_CHANNEL}').")
-                channel_entity = dialog.entity
-                break
+            count += 1
+            if count % 25 == 0:
+                print(f"  ...scanned {count} chats so far", flush=True)
+            if dialog.name == TELEGRAM_CHANNEL:
+                return dialog.entity, dialog.name, count
+            if loose_match is None and dialog.name.strip().lower() == TELEGRAM_CHANNEL.strip().lower():
+                loose_match = (dialog.entity, dialog.name)
+        if loose_match:
+            return loose_match[0], loose_match[1], count
+        return None, None, count
+
+    try:
+        channel_entity, matched_name, scanned = await asyncio.wait_for(find_channel(), timeout=45)
+    except asyncio.TimeoutError:
+        raise SystemExit(
+            "Timed out after 45s scanning your chat list for a match. This "
+            "can happen with a very large number of chats, or another "
+            "network hiccup talking to Telegram. Try redeploying once; if "
+            "it keeps happening, this may need pagination/rate-limit "
+            "handling added for accounts with a lot of chats."
+        )
+
+    print(f"Finished scanning {scanned} chats.", flush=True)
     if channel_entity is None:
         raise SystemExit(
-            f"Could not find a chat titled '{TELEGRAM_CHANNEL}' among your Telegram "
-            f"chats. This means either: the name doesn't match exactly (check for "
-            f"typos, extra spaces, or a trailing emoji in the real channel name), or "
+            f"Could not find a chat titled '{TELEGRAM_CHANNEL}' among your {scanned} "
+            f"Telegram chats. This means either: the name doesn't match exactly (check "
+            f"for typos, extra spaces, or a trailing emoji in the real channel name), or "
             f"the account this session belongs to isn't a member of that channel. "
             f"No alerts can be received until this resolves."
         )
-    print(f"Connected to channel: {channel_entity.title}")
+    if matched_name != TELEGRAM_CHANNEL:
+        print(f"Note: matched '{matched_name}' by case-insensitive title "
+              f"(TELEGRAM_CHANNEL was set to '{TELEGRAM_CHANNEL}').", flush=True)
+    print(f"Connected to channel: {matched_name}", flush=True)
 
     @client.on(events.NewMessage(chats=channel_entity))
     async def handler(event):
