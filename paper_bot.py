@@ -133,6 +133,27 @@ def init_db():
             cur.execute("""CREATE TABLE IF NOT EXISTS skipped (
                 portfolio TEXT, ts TEXT, contract TEXT, name TEXT, reason TEXT)""")
 
+        # Migration: older deployments' trades table predates peak_ratio.
+        # peak_ratio is the highest ratio (current_mcap / entry_mcap) the
+        # token ever reached while the position was open, regardless of
+        # what target/stop actually closed it - this is what lets us later
+        # ask "would this have hit 1.5x?" for a target the bot wasn't even
+        # using at the time.
+        if USE_PG:
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS peak_ratio REAL")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS bet_size REAL")
+        else:
+            try:
+                cur.execute("ALTER TABLE trades ADD COLUMN peak_ratio REAL")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+            try:
+                cur.execute("ALTER TABLE trades ADD COLUMN bet_size REAL")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+
 
 def ensure_portfolios(starting_balance):
     with db() as con:
@@ -281,9 +302,10 @@ class PaperEngine:
         return bet_size
 
     def close_position(self, pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                        bet_size, remaining_pct, realized_pnl, exit_mcap, reason):
+                        bet_size, remaining_pct, realized_pnl, exit_mcap, reason, peak_ratio=1.0):
         cfg = self.cfg
         ratio = exit_mcap / entry_mcap if entry_mcap else 1.0
+        peak_ratio = max(peak_ratio, ratio)  # in case the closing tick itself is the peak
         remaining_value = bet_size * remaining_pct
         fee = remaining_value * (cfg["fee_pct"] / 100)
         final_pnl = realized_pnl + remaining_value * (ratio - 1.0) - fee
@@ -294,22 +316,32 @@ class PaperEngine:
             cur = con.cursor()
             cur.execute(ph("""
                 INSERT INTO trades (portfolio, contract, name, entry_time, exit_time,
-                                     entry_mcap, exit_mcap, exit_reason, pnl, balance_after)
-                VALUES (?,?,?,?,?,?,?,?,?,?)"""),
+                                     entry_mcap, exit_mcap, exit_reason, pnl, balance_after,
+                                     peak_ratio, bet_size)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"""),
                 (portfolio, contract, name, entry_time, now_iso(), entry_mcap, exit_mcap,
-                 reason, final_pnl, new_balance))
+                 reason, final_pnl, new_balance, peak_ratio, bet_size))
             cur.execute(ph("DELETE FROM open_positions WHERE id=?"), (pos_id,))
         tag = "WIN " if final_pnl > 0 else "LOSS"
-        print(f"[{portfolio}] {tag} {name} exit={reason} pnl=${final_pnl:+.2f} balance=${new_balance:,.2f}")
+        print(f"[{portfolio}] {tag} {name} exit={reason} pnl=${final_pnl:+.2f} "
+              f"balance=${new_balance:,.2f} peak={peak_ratio:.2f}x")
 
-    async def monitor_position(self, pos_id, portfolio, contract, name, entry_time, entry_mcap, bet_size):
+    async def monitor_position(self, pos_id, portfolio, contract, name, entry_time, entry_mcap, bet_size,
+                                remaining_pct=1.0, realized_pnl=0.0, peak_ratio=1.0,
+                                tier1_done=False, tier2_done=False):
         cfg = self.cfg
         started = time.time()
-        remaining_pct = 1.0
-        realized_pnl = 0.0
-        peak_ratio = 1.0
-        tier1_done = False
-        tier2_done = False
+
+        def persist_state():
+            # Keeps peak_ratio (and the rest of the scaled portfolio's
+            # partial-exit state) durable across restarts, not just held in
+            # this coroutine's local variables.
+            with db() as con:
+                con.cursor().execute(ph("""
+                    UPDATE open_positions
+                    SET remaining_pct=?, realized_pnl=?, peak_ratio=?, tier1_done=?, tier2_done=?
+                    WHERE id=?"""),
+                    (remaining_pct, realized_pnl, peak_ratio, int(tier1_done), int(tier2_done), pos_id))
 
         while True:
             await asyncio.sleep(cfg["price_poll_seconds"])
@@ -319,7 +351,8 @@ class PaperEngine:
             if mcap is None:
                 if elapsed_min >= cfg["timeout_minutes"]:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, remaining_pct, realized_pnl, entry_mcap, "timeout (no price data)")
+                                         bet_size, remaining_pct, realized_pnl, entry_mcap,
+                                         "timeout (no price data)", peak_ratio)
                     return
                 continue
 
@@ -331,16 +364,17 @@ class PaperEngine:
                 stop = 1 - cfg["fixed_stop_loss_pct"] / 100
                 if ratio >= target:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, 1.0, 0.0, mcap, f"target {target}x")
+                                         bet_size, 1.0, 0.0, mcap, f"target {target}x", peak_ratio)
                     return
                 if ratio <= stop:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, 1.0, 0.0, mcap, "stop-loss")
+                                         bet_size, 1.0, 0.0, mcap, "stop-loss", peak_ratio)
                     return
                 if elapsed_min >= cfg["timeout_minutes"]:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, 1.0, 0.0, mcap, "timeout")
+                                         bet_size, 1.0, 0.0, mcap, "timeout", peak_ratio)
                     return
+                persist_state()
             else:
                 stop = 1 - cfg["scaled_stop_loss_pct"] / 100
                 trail = 1 - cfg["scaled_trailing_pct"] / 100
@@ -359,21 +393,23 @@ class PaperEngine:
 
                 if tier1_done and ratio <= peak_ratio * trail:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, remaining_pct, realized_pnl, mcap, "trailing stop")
+                                         bet_size, remaining_pct, realized_pnl, mcap, "trailing stop", peak_ratio)
                     return
                 if not tier1_done and ratio <= stop:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, remaining_pct, realized_pnl, mcap, "stop-loss")
+                                         bet_size, remaining_pct, realized_pnl, mcap, "stop-loss", peak_ratio)
                     return
                 if elapsed_min >= cfg["timeout_minutes"]:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, remaining_pct, realized_pnl, mcap, "timeout")
+                                         bet_size, remaining_pct, realized_pnl, mcap, "timeout", peak_ratio)
                     return
+                persist_state()
 
 
 # ------------------------------- dashboard HTML -------------------------------
 
 def render_dashboard():
+    cfg = load_config()
     portfolios = {}
     with db() as con:
         cur = con.cursor()
@@ -387,11 +423,30 @@ def render_dashboard():
             wins = wins or 0
             cur.execute(ph("SELECT COUNT(*) FROM open_positions WHERE portfolio=?"), (name,))
             open_count = cur.fetchone()[0]
-            cur.execute(ph("""SELECT name, exit_reason, pnl, balance_after
+            cur.execute(ph("""SELECT name, exit_reason, pnl, balance_after, peak_ratio
                               FROM trades WHERE portfolio=? ORDER BY id DESC LIMIT 15"""), (name,))
             recent = cur.fetchall()
+            cur.execute(ph("""SELECT COUNT(*), SUM(CASE WHEN peak_ratio>=1.5 THEN 1 ELSE 0 END)
+                              FROM trades WHERE portfolio=?"""), (name,))
+            hit_total, hit_1_5 = cur.fetchone()
+            hit_total = hit_total or 0
+            hit_1_5 = hit_1_5 or 0
             portfolios[name] = {"balance": bal, "curve": curve, "total": total,
-                                 "wins": wins, "open_count": open_count, "recent": recent}
+                                 "wins": wins, "open_count": open_count, "recent": recent,
+                                 "hit_total": hit_total, "hit_1_5": hit_1_5}
+
+        # Hypothetical: what would the "fixed" portfolio's closed trades have
+        # done under a 1.5x target instead of whatever fixed_target_multiple
+        # actually was at the time? If a trade's peak_ratio ever reached
+        # 1.5x, it must have passed through 1.5x before any later stop-loss
+        # or timeout could trigger (price has to rise through 1.5x, then
+        # fall back down through 1.0x, to reach a stop below entry) - so a
+        # 1.5x target would have closed it right there, at 1.5x. If it never
+        # reached 1.5x, a 1.5x target changes nothing and the real recorded
+        # outcome stands.
+        cur.execute("""SELECT bet_size, peak_ratio, pnl
+                       FROM trades WHERE portfolio='fixed'""")
+        fixed_trades_raw = cur.fetchall()
 
         cur.execute("""SELECT ts, contract, name, reason FROM skipped
                        ORDER BY ts DESC LIMIT 20""")
@@ -400,6 +455,27 @@ def render_dashboard():
         skip_cap_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM skipped WHERE reason LIKE 'unparsed%'")
         skip_parse_count = cur.fetchone()[0]
+
+    # Hypothetical: what would "fixed" portfolio trades have done under a
+    # 1.5x target instead of whatever fixed_target_multiple actually was?
+    # If a trade's peak_ratio ever reached 1.5x, it must have passed through
+    # 1.5x before any later stop-loss or timeout could trigger (price has to
+    # rise through 1.5x, then fall back down through 1.0x, to reach a stop
+    # below entry) - so a 1.5x target would have closed it right there, at
+    # 1.5x. If it never reached 1.5x, a 1.5x target changes nothing and the
+    # real recorded outcome stands. Uses each trade's own actual bet_size,
+    # so it's exact even if position_size_pct or fee_pct changed over time.
+    hypo_target = 1.5
+    fee_pct = cfg["fee_pct"]
+    actual_total = sum(pnl for _, _, pnl in fixed_trades_raw)
+    hypo_hit_count = sum(1 for _, peak, _ in fixed_trades_raw if peak is not None and peak >= hypo_target)
+    hypo_total = 0.0
+    for bet_size, peak_ratio, pnl in fixed_trades_raw:
+        if bet_size is not None and peak_ratio is not None and peak_ratio >= hypo_target:
+            hypo_total += bet_size * ((hypo_target - 1) - fee_pct / 100)
+        else:
+            hypo_total += pnl  # never reached 1.5x (or pre-migration row missing bet_size): unaffected
+    fixed_trade_count = len(fixed_trades_raw)
 
     def curve_svg(curve, color):
         if len(curve) < 2:
@@ -418,16 +494,21 @@ def render_dashboard():
     def rows_html(recent):
         if not recent:
             return '<div class="muted">No closed trades yet.</div>'
-        out = ['<table><tr><th>Token</th><th>Exit</th><th>P&L</th><th>Balance</th></tr>']
-        for name, reason, pnl, bal_after in recent:
+        out = ['<table><tr><th>Token</th><th>Exit</th><th>P&L</th><th>Balance</th><th>Peak</th><th>1.5x?</th></tr>']
+        for name, reason, pnl, bal_after, peak_ratio in recent:
             cls = "win" if pnl > 0 else "loss"
+            peak_str = f"{peak_ratio:.2f}x" if peak_ratio is not None else "—"
+            hit_str = ('<span class="win">yes</span>' if peak_ratio is not None and peak_ratio >= 1.5
+                       else ('<span class="loss">no</span>' if peak_ratio is not None else "—"))
             out.append(f'<tr><td>{name}</td><td>{reason}</td>'
-                       f'<td class="{cls}">${pnl:+.2f}</td><td>${bal_after:,.2f}</td></tr>')
+                       f'<td class="{cls}">${pnl:+.2f}</td><td>${bal_after:,.2f}</td>'
+                       f'<td>{peak_str}</td><td>{hit_str}</td></tr>')
         out.append("</table>")
         return "".join(out)
 
     def panel(title, p, color):
         wr = (p["wins"] / p["total"] * 100) if p["total"] else 0
+        hr = (p["hit_1_5"] / p["hit_total"] * 100) if p["hit_total"] else 0
         return f"""
         <div class="panel">
           <h2>{title}</h2>
@@ -436,6 +517,7 @@ def render_dashboard():
             <div><span class="muted">Win rate</span><br>{wr:.1f}%</div>
             <div><span class="muted">Trades closed</span><br>{p['total']}</div>
             <div><span class="muted">Open now</span><br>{p['open_count']}</div>
+            <div><span class="muted">Ever hit 1.5x</span><br>{p['hit_1_5']}/{p['hit_total']} ({hr:.0f}%)</div>
           </div>
           {curve_svg(p['curve'], color)}
           <h3>Recent trades</h3>
@@ -455,6 +537,23 @@ def render_dashboard():
             out.append(f'<tr><td>{t}</td><td>{label}</td><td>{reason}</td></tr>')
         out.append("</table>")
         return "".join(out)
+
+    hypo_diff = hypo_total - actual_total
+    hypo_diff_cls = "win" if hypo_diff > 0 else ("loss" if hypo_diff < 0 else "")
+    hypo_panel = f"""
+        <div class="panel" style="max-width:1200px;margin:24px auto 0;">
+          <h2>If the fixed target had been 1.5x</h2>
+          <div class="muted">Calculated from real history: every closed "fixed" trade's actual
+          recorded peak. If a trade's peak reached 1.5x, it's re-priced at exactly 1.5x
+          (minus the same fee); if it never reached 1.5x, its real outcome is unchanged.</div>
+          <div class="stats" style="margin-top:14px;">
+            <div><span class="muted">Fixed trades closed</span><br>{fixed_trade_count}</div>
+            <div><span class="muted">Would have hit 1.5x</span><br>{hypo_hit_count}/{fixed_trade_count}</div>
+            <div><span class="muted">Actual total P&L</span><br>${actual_total:,.2f}</div>
+            <div><span class="muted">Hypothetical 1.5x total P&L</span><br>${hypo_total:,.2f}</div>
+            <div><span class="muted">Difference</span><br><span class="{hypo_diff_cls}">${hypo_diff:+,.2f}</span></div>
+          </div>
+        </div>"""
 
     skips_panel = f"""
         <div class="panel" style="max-width:1200px;margin:24px auto 0;">
@@ -493,6 +592,7 @@ def render_dashboard():
     {panel("Fixed target", portfolios["fixed"], "#7fae7f")}
     {panel("Scaled + trailing", portfolios["scaled"], "#d6a24c")}
   </div>
+  {hypo_panel}
   {skips_panel}
   <div class="updated">Auto-refreshes every 20s · last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
   &nbsp;·&nbsp;<a href="/admin" style="color:#948c7c;">set balance</a></div>
@@ -611,12 +711,20 @@ async def main():
     # resume monitoring any positions left open from before a restart
     with db() as con:
         cur = con.cursor()
-        cur.execute("SELECT id, portfolio, contract, name, entry_time, entry_mcap, bet_size FROM open_positions")
+        cur.execute("""SELECT id, portfolio, contract, name, entry_time, entry_mcap, bet_size,
+                              remaining_pct, realized_pnl, peak_ratio, tier1_done, tier2_done
+                       FROM open_positions""")
         open_rows = cur.fetchall()
     for row in open_rows:
-        asyncio.create_task(engine.monitor_position(*row))
+        pos_id, portfolio, contract, name, entry_time, entry_mcap, bet_size, \
+            remaining_pct, realized_pnl, peak_ratio, tier1_done, tier2_done = row
+        asyncio.create_task(engine.monitor_position(
+            pos_id, portfolio, contract, name, entry_time, entry_mcap, bet_size,
+            remaining_pct=remaining_pct, realized_pnl=realized_pnl, peak_ratio=peak_ratio,
+            tier1_done=bool(tier1_done), tier2_done=bool(tier2_done)))
     if open_rows:
-        print(f"Resumed monitoring {len(open_rows)} position(s) from before restart.")
+        print(f"Resumed monitoring {len(open_rows)} position(s) from before restart "
+              f"(peak ratios and partial-exit state restored, not reset).")
 
     # Never allow an interactive login attempt on a headless server - if the
     # session isn't already valid, client.start() would otherwise sit here
