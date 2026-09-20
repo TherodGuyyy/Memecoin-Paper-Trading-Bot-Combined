@@ -232,14 +232,37 @@ def log_skip(portfolio, contract, name, reason):
     print(f"[skip] {reason}: {name or contract or '(unknown)'}")
 
 
-def parse_launch_alert(text):
+def parse_launch_alert(raw_text):
+    # This alert channel wraps several fields (the contract address, the
+    # market cap, the ticker) in backtick characters for Telegram's
+    # monospace/tap-to-copy formatting - e.g. `4VvSY...pump` instead of
+    # plain 4VvSY...pump. The regexes below only ever expected plain
+    # characters, so any field wrapped in backticks failed to match at all,
+    # and the whole alert got thrown away as "unparsed" - even for coins
+    # that went on to be big winners. Stripping backticks/asterisks up
+    # front fixes every regex below in one place, and is a no-op for any
+    # message format that never used them.
+    text = raw_text.replace("`", "").replace("*", "")
+
     if not any(h in text for h in LAUNCH_HEADERS):
         return None
 
     lines = text.split("\n")
     cmatch = CONTRACT_RE.search(text)
     contract = cmatch.group(1) if cmatch else None
-    name = lines[2].strip() if len(lines) > 2 and lines[2].strip() else (contract[:8] if contract else "unknown")
+
+    # The name usually sits on the line right before the clipboard (📋)
+    # marker that precedes the contract address. Anchoring to that marker
+    # is more robust than a fixed line index, since the number of divider
+    # lines above it can vary between alert formats/updates.
+    name = None
+    clip_idx = next((i for i, l in enumerate(lines) if "📋" in l), None)
+    if clip_idx is not None and clip_idx > 0 and lines[clip_idx - 1].strip():
+        name = lines[clip_idx - 1].strip()
+    elif len(lines) > 2 and lines[2].strip():
+        name = lines[2].strip()
+    if not name:
+        name = contract[:8] if contract else "unknown"
 
     if not cmatch:
         log_skip("parse", None, name, "unparsed: no contract address matched")
@@ -333,6 +356,7 @@ class PaperEngine:
         started = time.time()
         has_price_data = peak_ratio > 1.0  # a resumed position with a real peak already proves data existed
         last_known_mcap = entry_mcap
+        last_price_time = time.time()
         max_wait = cfg.get("max_wait_for_price_minutes", cfg["timeout_minutes"])
 
         def persist_state():
@@ -376,18 +400,32 @@ class PaperEngine:
                         return
                     continue
                 # We DO have a real price history for this token; a single
-                # missed poll doesn't erase it. Fall back to the last known
-                # real mcap for the timeout check instead of pretending the
-                # price went flat back to entry.
+                # missed poll doesn't erase it. But if the feed has been
+                # dark for a long stretch since the last real reading - e.g.
+                # the token got one snapshot near entry and then the pool
+                # got drained or DexScreener dropped it entirely - don't sit
+                # on it for the full timeout_minutes tying up exposure and
+                # eventually closing on a stale number that LOOKS like a
+                # boring "1.00-1.04x" close but is actually "we lost the
+                # feed almost immediately." Close it now, using the last
+                # real price, and say clearly how stale it is.
+                stale_min = (time.time() - last_price_time) / 60
+                if stale_min >= max_wait:
+                    self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
+                                         bet_size, remaining_pct, realized_pnl, last_known_mcap,
+                                         f"feed went dark ({stale_min:.0f}min since last real price, "
+                                         f"closed at last known {last_known_mcap/entry_mcap:.2f}x)", peak_ratio)
+                    return
                 if elapsed_min >= cfg["timeout_minutes"]:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
                                          bet_size, remaining_pct, realized_pnl, last_known_mcap,
-                                         "timeout (using last known price, feed briefly down)", peak_ratio)
+                                         f"timeout (last real price {stale_min:.0f}min old)", peak_ratio)
                     return
                 continue
 
             has_price_data = True
             last_known_mcap = mcap
+            last_price_time = time.time()
             ratio = mcap / entry_mcap
             peak_ratio = max(peak_ratio, ratio)
 
