@@ -5,6 +5,7 @@
   "fee_pct": 3,
   "timeout_minutes": 90,
   "price_poll_seconds": 15,
+  "max_wait_for_price_minutes": 15,
 
   "fixed_target_multiple": 2.2,
   "fixed_stop_loss_pct": 35,
@@ -19,6 +20,7 @@
     "max_exposure_pct": "Once this % of balance is tied up in open positions, new alerts are skipped.",
     "fee_pct": "Simulated round-trip fee + slippage, applied to every trade.",
     "timeout_minutes": "Force-close a position after this many minutes if neither target nor stop hit.",
+    "max_wait_for_price_minutes": "If DexScreener never returns ANY price data within this many minutes of opening (common for a token that hasn't been indexed yet, or an instant rug with no real pool), the position is VOIDED - no fake loss recorded, bet is untouched, logged separately from real trades.",
     "fixed_target_multiple": "Take-profit target for the 'Fixed target' portfolio.",
     "fixed_stop_loss_pct": "Stop-loss for the 'Fixed target' portfolio.",
     "scaled_stop_loss_pct": "Stop-loss for the 'Scaled + trailing' portfolio if 2x is never reached.",

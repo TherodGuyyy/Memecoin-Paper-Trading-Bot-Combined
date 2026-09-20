@@ -331,6 +331,9 @@ class PaperEngine:
                                 tier1_done=False, tier2_done=False):
         cfg = self.cfg
         started = time.time()
+        has_price_data = peak_ratio > 1.0  # a resumed position with a real peak already proves data existed
+        last_known_mcap = entry_mcap
+        max_wait = cfg.get("max_wait_for_price_minutes", cfg["timeout_minutes"])
 
         def persist_state():
             # Keeps peak_ratio (and the rest of the scaled portfolio's
@@ -343,19 +346,48 @@ class PaperEngine:
                     WHERE id=?"""),
                     (remaining_pct, realized_pnl, peak_ratio, int(tier1_done), int(tier2_done), pos_id))
 
+        def void_position(why):
+            # DexScreener never returned a single real price for this
+            # contract - most often because the pool hasn't been indexed
+            # yet, sometimes because it's an instant rug with no real pool
+            # ever forming. Either way, we never actually observed a price,
+            # so charging a fee against a fabricated 1.00x "exit" was
+            # dishonest bookkeeping - it made every data gap look like a
+            # small loss and quietly dragged the balance down over many
+            # trades ("slow death" from fees on trades that never really
+            # happened, not from real losing trades). Void it instead: no
+            # balance change, no trades-table row, logged separately so it's
+            # visible but doesn't pollute win rate or the 1.5x stats.
+            with db() as con:
+                con.cursor().execute(ph("DELETE FROM open_positions WHERE id=?"), (pos_id,))
+            log_skip(portfolio, contract, name, why)
+            print(f"[{portfolio}] VOID {name} - {why}")
+
         while True:
             await asyncio.sleep(cfg["price_poll_seconds"])
             elapsed_min = (time.time() - started) / 60
             mcap = fetch_mcap(contract)
 
             if mcap is None:
+                if not has_price_data:
+                    if elapsed_min >= max_wait:
+                        void_position(f"voided: no price data obtained within {max_wait}min "
+                                       f"of opening (token not indexed yet, or instant rug with no real pool)")
+                        return
+                    continue
+                # We DO have a real price history for this token; a single
+                # missed poll doesn't erase it. Fall back to the last known
+                # real mcap for the timeout check instead of pretending the
+                # price went flat back to entry.
                 if elapsed_min >= cfg["timeout_minutes"]:
                     self.close_position(pos_id, portfolio, contract, name, entry_time, entry_mcap,
-                                         bet_size, remaining_pct, realized_pnl, entry_mcap,
-                                         "timeout (no price data)", peak_ratio)
+                                         bet_size, remaining_pct, realized_pnl, last_known_mcap,
+                                         "timeout (using last known price, feed briefly down)", peak_ratio)
                     return
                 continue
 
+            has_price_data = True
+            last_known_mcap = mcap
             ratio = mcap / entry_mcap
             peak_ratio = max(peak_ratio, ratio)
 
@@ -455,6 +487,8 @@ def render_dashboard():
         skip_cap_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM skipped WHERE reason LIKE 'unparsed%'")
         skip_parse_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM skipped WHERE reason LIKE 'voided%'")
+        skip_void_count = cur.fetchone()[0]
 
     # Hypothetical: what would "fixed" portfolio trades have done under a
     # 1.5x target instead of whatever fixed_target_multiple actually was?
@@ -561,6 +595,7 @@ def render_dashboard():
           <div class="stats">
             <div><span class="muted">Exposure cap skips</span><br>{skip_cap_count}</div>
             <div><span class="muted">Unparsed alert skips</span><br>{skip_parse_count}</div>
+            <div><span class="muted">Voided (no price data)</span><br>{skip_void_count}</div>
           </div>
           <h3>Most recent 20</h3>
           {skips_html()}
