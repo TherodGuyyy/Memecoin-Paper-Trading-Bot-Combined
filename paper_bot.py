@@ -324,6 +324,84 @@ class PaperEngine:
         print(f"[{portfolio}] OPEN  {name} ({contract[:6]}...) bet=${bet_size:.2f} entry_mcap=${entry_mcap:,.0f}")
         return bet_size
 
+    async def watch_for_dip(self, contract, name, alert_mcap):
+        """Watches a freshly-alerted token BEFORE any money commits, waiting
+        for a qualifying pullback rather than buying instantly at the alert
+        price. Returns the mcap to enter at if a qualifying dip happens, or
+        None if the watch was abandoned (too sharp a drop, no price data
+        ever, or it never dipped enough within the watch window) - in every
+        None case, the reason is already logged via log_skip.
+
+        Peak tracking starts from the alert price itself (a token can pump
+        further before ever dipping), and the dip is always measured off
+        the highest point seen so far - so a fresh new high resets what
+        counts as a "dip" going forward.
+        """
+        cfg = self.cfg
+        if not cfg.get("dip_entry_enabled", False):
+            return alert_mcap  # feature off: behave exactly like instant-buy
+
+        buy_min = cfg["dip_buy_min_pct"]
+        buy_max = cfg["dip_buy_max_pct"]
+        skip_pct = cfg["dip_skip_pct"]
+        min_bounce = cfg.get("dip_min_bounce_pct", 0)
+        max_wait = cfg["dip_watch_max_minutes"]
+        no_data_wait = cfg.get("max_wait_for_price_minutes", max_wait)
+
+        started = time.time()
+        peak = alert_mcap
+        trough = alert_mcap  # lowest point seen since the most recent peak
+        has_price_data = False
+        last_price_time = time.time()
+
+        while True:
+            await asyncio.sleep(cfg["price_poll_seconds"])
+            elapsed_min = (time.time() - started) / 60
+            mcap = fetch_mcap(contract)
+
+            if mcap is None:
+                if not has_price_data and elapsed_min >= no_data_wait:
+                    log_skip("dip-watch", contract, name,
+                              f"voided: no price data obtained within {no_data_wait}min "
+                              f"while waiting for a dip entry")
+                    return None
+                if has_price_data and (time.time() - last_price_time) / 60 >= no_data_wait:
+                    log_skip("dip-watch", contract, name,
+                              f"abandoned: feed went dark while waiting for a dip entry "
+                              f"(last real price was {(time.time()-last_price_time)/60:.0f}min ago)")
+                    return None
+                if elapsed_min >= max_wait:
+                    log_skip("dip-watch", contract, name,
+                              f"no price data within the {max_wait}min watch window - abandoned")
+                    return None
+                continue
+
+            has_price_data = True
+            last_price_time = time.time()
+            if mcap >= peak:
+                peak = mcap
+                trough = mcap  # a fresh high resets what counts as "the low of this pullback"
+            else:
+                trough = min(trough, mcap)
+            dip_pct = (peak - mcap) / peak * 100 if peak else 0
+            bounce_pct = (mcap - trough) / trough * 100 if trough else 0
+
+            if dip_pct >= skip_pct:
+                log_skip("dip-watch", contract, name,
+                          f"dip too sharp ({dip_pct:.0f}% down from peak ${peak:,.0f}) - never entered")
+                return None
+
+            if buy_min <= dip_pct <= buy_max and bounce_pct >= min_bounce:
+                print(f">>> dip confirmed: {name} is {dip_pct:.0f}% down from peak ${peak:,.0f}, "
+                      f"bounced {bounce_pct:.0f}% off low ${trough:,.0f} -> entering at ${mcap:,.0f}")
+                return mcap
+
+            if elapsed_min >= max_wait:
+                log_skip("dip-watch", contract, name,
+                          f"never reached a qualifying {buy_min}-{buy_max}% dip with {min_bounce}%+ bounce "
+                          f"within {max_wait}min (last seen {dip_pct:.0f}% off peak, {bounce_pct:.0f}% bounce) - abandoned")
+                return None
+
     def close_position(self, pos_id, portfolio, contract, name, entry_time, entry_mcap,
                         bet_size, remaining_pct, realized_pnl, exit_mcap, reason, peak_ratio=1.0):
         cfg = self.cfg
@@ -871,31 +949,51 @@ async def main():
               f"(TELEGRAM_CHANNEL was set to '{TELEGRAM_CHANNEL}').", flush=True)
     print(f"Connected to channel: {matched_name}", flush=True)
 
+    watching_contracts = set()  # contracts currently in the dip-watch phase, to dedup repeat alerts
+
     @client.on(events.NewMessage(chats=channel_entity))
     async def handler(event):
         alert = parse_launch_alert(event.raw_text or "")
         if not alert:
             return
-        print(f"\n>>> alert: {alert['name']} ({alert['contract'][:6]}...) mcap=${alert['mcap']:,.0f}")
-        for portfolio in ("fixed", "scaled"):
-            with db() as con:
-                cur = con.cursor()
-                cur.execute(ph("SELECT COUNT(*) FROM open_positions WHERE contract=? AND portfolio=?"),
-                            (alert["contract"], portfolio))
-                already_open = cur.fetchone()[0]
-            if already_open:
-                continue
-            bet_size = engine.try_open(portfolio, alert["contract"], alert["name"], alert["mcap"])
-            if bet_size is None:
-                continue
-            with db() as con:
-                cur = con.cursor()
-                cur.execute(ph("""SELECT id, portfolio, contract, name, entry_time, entry_mcap, bet_size
-                                  FROM open_positions WHERE contract=? AND portfolio=?
-                                  ORDER BY id DESC LIMIT 1"""), (alert["contract"], portfolio))
-                row = cur.fetchone()
-            if row:
-                asyncio.create_task(engine.monitor_position(*row))
+        contract, name, alert_mcap = alert["contract"], alert["name"], alert["mcap"]
+        print(f"\n>>> alert: {name} ({contract[:6]}...) mcap=${alert_mcap:,.0f}")
+
+        with db() as con:
+            cur = con.cursor()
+            cur.execute(ph("SELECT COUNT(*) FROM open_positions WHERE contract=?"), (contract,))
+            already_open = cur.fetchone()[0]
+        if already_open or contract in watching_contracts:
+            return
+        watching_contracts.add(contract)
+        asyncio.create_task(watch_then_open(contract, name, alert_mcap))
+
+    async def watch_then_open(contract, name, alert_mcap):
+        try:
+            entry_mcap = await engine.watch_for_dip(contract, name, alert_mcap)
+            if entry_mcap is None:
+                return  # abandoned; watch_for_dip already logged why
+            for portfolio in ("fixed", "scaled"):
+                with db() as con:
+                    cur = con.cursor()
+                    cur.execute(ph("SELECT COUNT(*) FROM open_positions WHERE contract=? AND portfolio=?"),
+                                (contract, portfolio))
+                    already_open = cur.fetchone()[0]
+                if already_open:
+                    continue
+                bet_size = engine.try_open(portfolio, contract, name, entry_mcap)
+                if bet_size is None:
+                    continue
+                with db() as con:
+                    cur = con.cursor()
+                    cur.execute(ph("""SELECT id, portfolio, contract, name, entry_time, entry_mcap, bet_size
+                                      FROM open_positions WHERE contract=? AND portfolio=?
+                                      ORDER BY id DESC LIMIT 1"""), (contract, portfolio))
+                    row = cur.fetchone()
+                if row:
+                    asyncio.create_task(engine.monitor_position(*row))
+        finally:
+            watching_contracts.discard(contract)
 
     print("Listening for launch alerts...")
     await client.run_until_disconnected()

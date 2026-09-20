@@ -13,6 +13,13 @@
   "scaled_stop_loss_pct": 25,
   "scaled_trailing_pct": 15,
 
+  "dip_entry_enabled": true,
+  "dip_buy_min_pct": 7,
+  "dip_buy_max_pct": 55,
+  "dip_skip_pct": 70,
+  "dip_min_bounce_pct": 20,
+  "dip_watch_max_minutes": 45,
+
   "_comments": {
     "note": "Telegram credentials and the database connection are NOT in this file - they live in environment variables (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_CHANNEL, DATABASE_URL). This file has no secrets, so it's safe to commit to GitHub.",
     "starting_balance": "Your paper account's starting balance in dollars.",
@@ -24,6 +31,12 @@
     "fixed_target_multiple": "Take-profit target for the 'Fixed target' portfolio.",
     "fixed_stop_loss_pct": "Stop-loss for the 'Fixed target' portfolio.",
     "scaled_stop_loss_pct": "Stop-loss for the 'Scaled + trailing' portfolio if 2x is never reached.",
-    "scaled_trailing_pct": "Once 2x is hit, remaining position exits if price falls this % off peak."
+    "scaled_trailing_pct": "Once 2x is hit, remaining position exits if price falls this % off peak.",
+    "dip_entry_enabled": "If true, don't buy immediately on the alert - watch the token first and only buy on a qualifying pullback (see dip_buy_min_pct/dip_buy_max_pct/dip_min_bounce_pct). Set false to restore instant-buy-on-alert behavior.",
+    "dip_buy_min_pct": "Minimum pullback (% down from the peak price seen since the alert) required before buying.",
+    "dip_buy_max_pct": "Maximum pullback (%) still considered a healthy entry. Above this, we keep watching rather than buying (it might recover into the buy zone, or keep falling into the skip zone). Backed by real channel history: 30-60% dips still meaningfully beat the no-signal baseline (23%), so this is wider than a naive guess.",
+    "dip_skip_pct": "If the pullback ever goes past this % down from peak, the token is abandoned entirely - no entry, in either portfolio. Real channel history shows the hit-rate edge mostly disappears past ~65-70% down, not 45% as originally guessed.",
+    "dip_min_bounce_pct": "Minimum recovery off the LOCAL LOW (not off peak) required before buying, on top of being in the dip_buy range. Real history shows dip depth alone under-predicts outcomes; a stronger bounce off the low (20%+) correlates with a meaningfully higher hit rate (~40% vs ~30% for weak bounces), so this is a separate, additional condition.",
+    "dip_watch_max_minutes": "Give up watching a token for a qualifying dip after this many minutes if it never triggers a buy or a skip (e.g. it just sits flat)."
   }
 }
