@@ -373,6 +373,7 @@ class PaperEngine:
         buy_max = cfg["dip_buy_max_pct"]
         skip_pct = cfg["dip_skip_pct"]
         min_bounce = cfg.get("dip_min_bounce_pct", 0)
+        max_pump_pct = cfg.get("dip_max_pump_pct")  # None = no ceiling
         max_wait = cfg["dip_watch_max_minutes"]
         no_data_wait = cfg.get("max_wait_for_price_minutes", max_wait)
 
@@ -409,6 +410,20 @@ class PaperEngine:
             if mcap >= peak:
                 peak = mcap
                 trough = mcap  # a fresh high resets what counts as "the low of this pullback"
+                # A ceiling on how far above the ORIGINAL alert price we're
+                # willing to chase, independent of dip%/bounce% looking
+                # "qualifying." Buying a pullback after a mild pop and
+                # buying a pullback after an already-exhausted 800%+ run are
+                # very different trades - the latter risks paying near the
+                # top of a pump-and-dump that has nowhere left to go, even
+                # though the dip/bounce math looks identical either way.
+                if max_pump_pct is not None and alert_mcap:
+                    pump_pct = (peak - alert_mcap) / alert_mcap * 100
+                    if pump_pct > max_pump_pct:
+                        log_skip("dip-watch", contract, name,
+                                  f"pumped too far before any dip ({pump_pct:.0f}% above alert "
+                                  f"${alert_mcap:,.0f}, now ${peak:,.0f}) - abandoned, too risky to chase")
+                        return None
             else:
                 trough = min(trough, mcap)
             dip_pct = (peak - mcap) / peak * 100 if peak else 0

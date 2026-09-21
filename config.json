@@ -18,6 +18,7 @@
   "dip_buy_max_pct": 55,
   "dip_skip_pct": 70,
   "dip_min_bounce_pct": 20,
+  "dip_max_pump_pct": 150,
   "dip_watch_max_minutes": 45,
 
   "_comments": {
@@ -37,6 +38,7 @@
     "dip_buy_max_pct": "Maximum pullback (%) still considered a healthy entry. Above this, we keep watching rather than buying (it might recover into the buy zone, or keep falling into the skip zone). Backed by real channel history: 30-60% dips still meaningfully beat the no-signal baseline (23%), so this is wider than a naive guess.",
     "dip_skip_pct": "If the pullback ever goes past this % down from peak, the token is abandoned entirely - no entry, in either portfolio. Real channel history shows the hit-rate edge mostly disappears past ~65-70% down, not 45% as originally guessed.",
     "dip_min_bounce_pct": "Minimum recovery off the LOCAL LOW (not off peak) required before buying, on top of being in the dip_buy range. Real history shows dip depth alone under-predicts outcomes; a stronger bounce off the low (20%+) correlates with a meaningfully higher hit rate (~40% vs ~30% for weak bounces), so this is a separate, additional condition.",
+    "dip_max_pump_pct": "Safety cap, NOT validated against the historical dataset (that data didn't track prior-pump size). If the token's peak since the alert ever exceeds the ORIGINAL alert price by more than this %, the watch is abandoned entirely - buying a 'dip' after the token already pumped 800%+ is a fundamentally different, riskier trade than buying a mild pullback shortly after launch, even if the dip% and bounce% both look qualifying. Without this, the bot will happily chase a dip after any size of prior pump.",
     "dip_watch_max_minutes": "Give up watching a token for a qualifying dip after this many minutes if it never triggers a buy or a skip (e.g. it just sits flat)."
   }
 }
